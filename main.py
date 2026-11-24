@@ -1,203 +1,284 @@
-"""mimo - firmware de la Pico W con los pines del diagrama de referencia.
-Guárdalo en la Pico como main.py. Necesita ssd1306.py en la Pico (opcional: sin OLED también corre).
+import json, os, re, sys, threading, time
+from datetime import datetime, timedelta
 
-Qué hace:
-  - DHT11 -> manda temperatura y humedad a la app.
-  - Ultrasónico (alguien a menos de UMBRAL_CM) o botón Wake -> despierta a mimo.
-  - Botón Scan -> apaga la alarma si está sonando (si no, despierta).
-  - Atiende las órdenes de la app: despertar, dormir, alarma_on, alarma_off (mueve el servo).
-  - OLED: muestra modo, temperatura, distancia y Wi-Fi.
-"""
-import network
-import time
-import urequests
-import dht
-from machine import Pin, PWM, I2C, time_pulse_us
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-WIFI = "TU_RED"
-CLAVE = "TU_CONTRASEÑA"
-SERVIDOR = "http://192.168.1.50:8000"   # IP de la laptop (ipconfig)
+# Rutas:
+EMPAQUETADO = getattr(sys, "frozen", False)
+AQUI = os.path.dirname(sys.executable) if EMPAQUETADO else os.path.dirname(os.path.abspath(__file__))
+WEB = os.path.join(sys._MEIPASS, "web") if EMPAQUETADO else os.path.join(AQUI, "..", "web")
+ARCHIVO = os.path.join(AQUI, "data.json")  
+IDLE = 45  
+DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+         "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
 
-UMBRAL_CM = 80             # a menos de esta distancia se considera "hay alguien"
-CADA_SENSOR_MS = 5000
-PAUSA_DESPERTAR_MS = 3000
+app = FastAPI()
 
-# ---- Pines (diagrama de referencia) ----
-sensor = dht.DHT11(Pin(12))
-btn_scan = Pin(13, Pin.IN, Pin.PULL_DOWN)   # un pie a 3V3, activo en 1
-btn_wake = Pin(14, Pin.IN, Pin.PULL_UP)     # un pie a GND, activo en 0
-trig = Pin(16, Pin.OUT)
-echo = Pin(17, Pin.IN)                      # ¡con divisor 1 kΩ + 2 kΩ!
-servo = PWM(Pin(15))
-servo.freq(50)
-led = Pin("LED", Pin.OUT)
-
-try:
-    import ssd1306
-    oled = ssd1306.SSD1306_I2C(128, 64, I2C(0, sda=Pin(0), scl=Pin(1)))
-except Exception as e:
-    oled = None
-    print("OLED no disponible:", e)
-
-wlan = network.WLAN(network.STA_IF)
-modo_txt, temp, hum, dist = "reposo", "--", "--", None
-alarma = False
+# modo: 
+estado = {"temperatura": None, "humedad": None, "modo": "reposo",
+          "aviso": None, "actividad": time.time(), "lectura": None}
+comandos = [] 
 
 
-def angulo(a):
-    a = max(0, min(180, a))
-    servo.duty_u16(int(1638 + (8192 - 1638) * a / 180))
+# guardado
+def cargar():
+    if os.path.exists(ARCHIVO):
+        with open(ARCHIVO) as f:
+            d = json.load(f)
+            return d.get("alarmas", []), d.get("recordatorios", [])
+    return [], []
 
 
-def medir_cm():
-    trig.low()
-    time.sleep_us(2)
-    trig.high()
-    time.sleep_us(10)
-    trig.low()
-    t = time_pulse_us(echo, 1, 30000)
-    return None if t < 0 else round(t / 58.2)
+def guardar():
+    with open(ARCHIVO, "w") as f:
+        json.dump({"alarmas": alarmas, "recordatorios": recordatorios}, f)
 
 
-def pantalla():
-    if not oled:
-        return
-    oled.fill(0)
-    oled.text("mimo", 0, 0)
-    oled.text(modo_txt, 48, 0)
-    oled.text("T:%s C H:%s %%" % (temp, hum), 0, 16)
-    oled.text("Dist: %s cm" % ("--" if dist is None else dist), 0, 32)
-    oled.text("WiFi OK" if wlan.isconnected() else "Sin WiFi", 0, 48)
-    oled.show()
+alarmas, recordatorios = cargar()
 
 
-def conectar():
-    wlan.active(True)
-    if wlan.isconnected():
-        return
-    wlan.connect(WIFI, CLAVE)
-    print("Conectando al Wi-Fi", end="")
-    while not wlan.isconnected():
-        print(".", end="")
-        led.toggle()
-        pantalla()
-        time.sleep(0.5)
-    led.on()
-    print("\nConectada. IP de la Pico:", wlan.ifconfig()[0])
+#Modelos
+class Lectura(BaseModel):
+    temperatura: float
+    humedad: float
+
+class Alarma(BaseModel):
+    hora: str            
+    repetir: bool = False
+    etiqueta: str = "Nueva alarma"
+
+class Recordatorio(BaseModel):
+    texto: str
+    cuando: str          
+
+class Pregunta(BaseModel):
+    texto: str
+
+class Comando(BaseModel):
+    accion: str
 
 
-def enviar(ruta, datos=None):
-    try:
-        r = urequests.post(SERVIDOR + ruta, json=datos or {})
-        r.close()
-        return True
-    except Exception as e:
-        print("Error de red:", e)
-        return False
+# Lógica 
+def tocar_actividad():
+    estado["actividad"] = time.time()
 
 
-def mover_cabeza():
-    for a in (60, 120, 90):
-        angulo(a)
-        time.sleep_ms(250)
+def sonar(aviso):
+    estado["aviso"] = aviso
+    estado["modo"] = "alarma"
+    comandos.append("alarma_on")
 
 
-def aplicar(c):
-    global alarma, modo_txt
-    print("Comando recibido:", c)
-    if c == "despertar":
-        modo_txt = "despierto"
-        mover_cabeza()
-    elif c == "dormir":
-        modo_txt, alarma = "reposo", False
-        angulo(90)
-    elif c == "alarma_on":
-        modo_txt, alarma = "ALARMA", True
-    elif c == "alarma_off":
-        modo_txt, alarma = "despierto", False
-        angulo(90)
+def apagar():
+    if estado["aviso"] is not None:
+        comandos.append("alarma_off")
+    estado["aviso"] = None
+    estado["modo"] = "despierto"
+    tocar_actividad()
 
 
-def atender_comandos():
-    try:
-        r = urequests.get(SERVIDOR + "/comandos")
-        lista = r.json()
-        r.close()
-        for c in lista:
-            aplicar(c)
-    except Exception as e:
-        print("Error de red:", e)
+def en_minutos(n):
+    return datetime.now() + timedelta(minutes=n)
 
 
-t_despertar = time.ticks_add(time.ticks_ms(), -PAUSA_DESPERTAR_MS)
+def resp(titulo, detalle, tipo="ok", accion=None):
+    return {"titulo": titulo, "detalle": detalle, "tipo": tipo, "accion": accion}
 
 
-def despertar(motivo):
-    global t_despertar
-    if time.ticks_diff(time.ticks_ms(), t_despertar) < PAUSA_DESPERTAR_MS:
-        return
-    t_despertar = time.ticks_ms()
-    print("Despertar por", motivo)
-    enviar("/despertar")
+def responder(texto):
+    """Comandos fijos de 'Preguntar' (funcionan sin internet)."""
+    t = texto.lower().strip()
+    m = re.search(r"recu[eé]rdame\s+(.+?)\s+en\s+(\d+)\s+minutos?", t)
+    if m:
+        cuando = en_minutos(int(m.group(2)))
+        txt = m.group(1).capitalize()
+        recordatorios.append({"texto": txt, "cuando": cuando.strftime("%Y-%m-%dT%H:%M")})
+        guardar()
+        return resp(f"Te lo recordaré a las {cuando.strftime('%H:%M')}.", f"Recordatorio creado: {txt}.", accion="recordatorio")
+    m = re.search(r"alarma.*?(\d{1,2})(?::(\d{2}))?", t)
+    if m and int(m.group(1)) < 24 and int(m.group(2) or 0) < 60:
+        hora = f"{int(m.group(1)):02d}:{int(m.group(2) or 0):02d}"
+        alarmas.append({"hora": hora, "repetir": False, "etiqueta": "Nueva alarma"})
+        guardar()
+        dia = "hoy" if hora > datetime.now().strftime("%H:%M") else "mañana"
+        return resp(f"Listo, {dia} a las {hora}.", "He creado una alarma de una sola vez.", accion="alarma")
+    if "hora" in t:
+        return resp("Son las " + datetime.now().strftime("%H:%M") + ".", "Un buen momento para seguir con tu día.")
+    if "fecha" in t or "día" in t:
+        d = datetime.now()
+        return resp(f"{DIAS[d.weekday()].capitalize()}, {d.day} de {MESES[d.month - 1]}.", f"Estamos en {d.year}.")
+    if "temperatura" in t or "humedad" in t or "calor" in t or "frío" in t:
+        if estado["temperatura"] is None:
+            return resp("Todavía no tengo lecturas.", "Esperando datos de la Pico.")
+        return resp(f"Hay {estado['temperatura']:.0f} °C en tu espacio.", f"Humedad: {estado['humedad']:.0f} %. Datos recibidos de la Pico.")
+    return resp("Eso todavía no lo entiendo.", "Puedo decirte la hora, la fecha y la temperatura, o crear alarmas y recordatorios.", tipo="no")
 
 
-def boton_scan():
-    global alarma, modo_txt
-    if alarma:
-        enviar("/aviso/apagar")
-        alarma, modo_txt = False, "despierto"
-        angulo(90)
-    else:
-        despertar("botón Scan")
+def vigilar():
+    """Revisa cada segundo alarmas, recordatorios y el regreso a reposo."""
+    while True:
+        ahora = datetime.now()
+        marca = ahora.strftime("%Y-%m-%d %H:%M")
+        if estado["aviso"] is None:
+            for a in alarmas[:]:
+                if a["hora"] == ahora.strftime("%H:%M") and a.get("ultimo") != marca:
+                    a["ultimo"] = marca
+                    if not a["repetir"]:
+                        alarmas.remove(a)
+                    guardar()
+                    sonar({"tipo": "alarma", "texto": a.get("etiqueta", "Nueva alarma"), "hora": a["hora"], "repetir": a["repetir"]})
+                    break
+        if estado["aviso"] is None:
+            for r in recordatorios[:]:
+                if r["cuando"] <= ahora.strftime("%Y-%m-%dT%H:%M"):
+                    recordatorios.remove(r)
+                    guardar()
+                    sonar({"tipo": "recordatorio", "texto": r["texto"], "cuando": r["cuando"]})
+                    break
+        if estado["modo"] == "despierto" and time.time() - estado["actividad"] > IDLE:
+            estado["modo"] = "reposo"
+            comandos.append("dormir")
+        time.sleep(1)
 
 
-angulo(90)
-conectar()
-ahora = time.ticks_ms()
-t_dist = t_sensor = t_cmd = t_oled = t_servo = ahora
-t_sensor = time.ticks_add(ahora, -CADA_SENSOR_MS)
-cuenta, w_antes, s_antes, lado = 0, 1, 0, False
+threading.Thread(target=vigilar, daemon=True).start()
 
-while True:
-    ahora = time.ticks_ms()
-    if not wlan.isconnected():
-        conectar()
 
-    w, s = btn_wake.value(), btn_scan.value()
-    if w == 0 and w_antes == 1:
-        despertar("botón Wake")
-    if s == 1 and s_antes == 0:
-        boton_scan()
-    w_antes, s_antes = w, s
+# Endpoints 
+@app.get("/estado")
+def obtener_estado():
+    d = datetime.now()
+    return {"hora": d.strftime("%H:%M:%S"),
+            "fecha": f"{DIAS[d.weekday()]} {d.day} de {MESES[d.month - 1]}",
+            "temperatura": estado["temperatura"], "humedad": estado["humedad"],
+            "modo": estado["modo"], "aviso": estado["aviso"],
+            "lectura_hace": None if estado["lectura"] is None else int(time.time() - estado["lectura"])}
 
-    if time.ticks_diff(ahora, t_dist) >= 200:
-        t_dist = ahora
-        dist = medir_cm()
-        cerca = dist is not None and dist < UMBRAL_CM
-        cuenta = cuenta + 1 if cerca else 0
-        if cuenta == 2:          # dos lecturas seguidas: alguien se acercó
-            despertar("ultrasónico")
 
-    if time.ticks_diff(ahora, t_sensor) >= CADA_SENSOR_MS:
-        t_sensor = ahora
-        try:
-            sensor.measure()
-            temp, hum = sensor.temperature(), sensor.humidity()
-            enviar("/sensor", {"temperatura": temp, "humedad": hum})
-        except OSError as e:
-            print("DHT11: error de lectura", e)
+@app.post("/sensor")
+def recibir_sensor(lectura: Lectura):
+    estado["temperatura"] = lectura.temperatura
+    estado["humedad"] = lectura.humedad
+    estado["lectura"] = time.time()
+    return {"ok": True}
 
-    if time.ticks_diff(ahora, t_cmd) >= 1000:
-        t_cmd = ahora
-        atender_comandos()
 
-    if alarma and time.ticks_diff(ahora, t_servo) >= 400:   # la cabeza se mueve mientras suena
-        t_servo = ahora
-        lado = not lado
-        angulo(60 if lado else 120)
+@app.post("/despertar")
+def despertar():
+    """Lo llaman la app (toque) y la Pico (PIR o botón). También reinicia el temporizador."""
+    if estado["modo"] == "reposo":
+        estado["modo"] = "despierto"
+        comandos.append("despertar")
+    tocar_actividad()
+    return {"modo": estado["modo"]}
 
-    if time.ticks_diff(ahora, t_oled) >= 1000:
-        t_oled = ahora
-        pantalla()
 
-    time.sleep_ms(30)
+@app.get("/comandos")
+def pedir_comandos():
+    pendientes = comandos.copy()
+    comandos.clear()
+    return pendientes
+
+
+@app.post("/comandos")
+def agregar_comando(c: Comando):
+    comandos.append(c.accion)
+    return {"ok": True}
+
+
+@app.get("/alarmas")
+def listar_alarmas():
+    return alarmas
+
+
+@app.post("/alarmas")
+def crear_alarma(a: Alarma):
+    alarmas.append({"hora": a.hora, "repetir": a.repetir, "etiqueta": a.etiqueta})
+    guardar()
+    return {"ok": True}
+
+
+@app.delete("/alarmas/{i}")
+def borrar_alarma(i: int):
+    if 0 <= i < len(alarmas):
+        alarmas.pop(i)
+        guardar()
+    return {"ok": True}
+
+
+@app.get("/recordatorios")
+def listar_recordatorios():
+    return sorted(recordatorios, key=lambda r: r["cuando"])
+
+
+@app.post("/recordatorios")
+def crear_recordatorio(r: Recordatorio):
+    recordatorios.append(r.model_dump())
+    guardar()
+    return {"ok": True}
+
+
+@app.delete("/recordatorios/{i}")
+def borrar_recordatorio(i: int):
+    ordenados = sorted(recordatorios, key=lambda r: r["cuando"])
+    if 0 <= i < len(ordenados):
+        recordatorios.remove(ordenados[i])
+        guardar()
+    return {"ok": True}
+
+
+@app.post("/preguntar")
+def preguntar(p: Pregunta):
+    tocar_actividad()
+    return responder(p.texto)
+
+
+@app.post("/aviso/apagar")
+def aviso_apagar():
+    apagar()
+    return {"ok": True}
+
+
+@app.post("/aviso/posponer")
+def aviso_posponer():
+    a = estado["aviso"]
+    cuando = en_minutos(5)
+    tipo = a["tipo"] if a else "alarma"
+    if a:
+        if tipo == "alarma":
+            alarmas.append({"hora": cuando.strftime("%H:%M"), "repetir": False, "etiqueta": a["texto"]})
+        else:
+            recordatorios.append({"texto": a["texto"], "cuando": cuando.strftime("%Y-%m-%dT%H:%M")})
+        guardar()
+    apagar()
+    return {"tipo": tipo, "hasta": cuando.strftime("%H:%M")}
+
+
+@app.post("/reposo")
+def ir_a_reposo():
+    if estado["modo"] == "despierto":
+        estado["modo"] = "reposo"
+        comandos.append("dormir")
+    return {"modo": estado["modo"]}
+
+# --
+app.mount("/", StaticFiles(directory=WEB, html=True), name="web")
+
+
+# para el .exe
+if __name__ == "__main__":
+    import uvicorn
+    import webbrowser
+    def abrir_navegador():
+        url = "http://localhost:8000"
+        if sys.platform == "win32":
+            perfil = os.path.join(AQUI, "perfil_mimo")
+            os.system(f'start "" msedge --user-data-dir="{perfil}" '
+                      f'--autoplay-policy=no-user-gesture-required --app={url}')
+        else:
+            webbrowser.open(url)
+    threading.Timer(1.5, abrir_navegador).start()
+    uvicorn.run(app, host="0.0.0.0", port=8000)
